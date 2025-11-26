@@ -1,0 +1,8 @@
+---
+- hosts: all
+  roles:
+    - kube-common
+
+- hosts: all
+  roles:
+    - kube-controlplane

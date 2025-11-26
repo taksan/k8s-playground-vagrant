@@ -1,0 +1,159 @@
+# swap is disabled because kubelet doesn't support it
+- name: Disables swap removing from /etc/fstab
+  mount:
+    name: "{{ item }}"
+    fstype: swap
+    state: absent
+  with_items:
+    - swap
+    - none
+  become: true
+
+- name: Disables swap
+  command: swapoff -a
+  when: ansible_swaptotal_mb > 0
+  become: true
+
+- name: Update apt
+  apt:
+    update_cache: yes
+  become: true
+
+- name: Create contained.conf
+  template:
+    src: templates/containerd.conf.j2
+    dest: /etc/modules-load.d/containerd.conf
+  become: true
+
+- name: Run modprobe overlay
+  shell: modprobe overlay
+  become: true
+
+- name: Run modprobe br_netfilter
+  shell: modprobe br_netfilter
+  become: true
+
+- name: Create kubernetes-cri.conf
+  template:
+    src: templates/kubernetes-cri.conf.j2
+    dest: /etc/sysctl.d/99-kubernetes-cri.conf
+  become: true
+
+- name: Apply sysctl settings
+  shell: sysctl --system
+  become: true
+
+- name: Install containerd
+  package:
+    name: containerd
+    state: present
+  become: true
+
+- name: Create containderd config
+  shell: |
+    mkdir -p /etc/containerd
+    containerd config default > /etc/containerd/config.toml
+  become: true
+
+- name: Create kernel config
+  template:
+    src: templates/k8s.conf.j2
+    dest: /etc/modules-load.d/k8s.conf
+  become: true
+
+- name: Apply sysctl settings
+  shell: sysctl --system
+  become: true
+
+# change containderd config
+- name: Change containerd config
+  shell: |
+    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
+  become: true
+  notify: restart containerd
+
+- name: Install packages to setup kubernetes repo
+  package:
+    name: "{{ item }}"
+    state: present
+  become: true
+  loop:
+    - apt-transport-https 
+    - ca-certificates 
+    - curl
+    - gpg
+
+# Setup k8 srepo
+- name: Check if k8s gpg key file exists
+  stat:
+    path: /etc/apt/keyrings/kubernetes-{{kube_version}}-apt-keyring.gpg
+  register: gpg_key_file
+
+- name: Setup kubernetes repo
+  shell: |
+    set -e
+    # make sure to remove older gpg key file and apt list file
+    rm -f /etc/apt/keyrings/kubernetes-*.gpg
+    rm -f /etc/apt/sources.list.d/kubernetes*.list
+
+    # install new gpg key file and apt list file
+    curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{kube_version}}/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-{{kube_version}}-apt-keyring.gpg
+    echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-{{kube_version}}-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{kube_version}}/deb/ /' > /etc/apt/sources.list.d/kubernetes-{{kube_version}}.list
+  become: true
+  when: gpg_key_file.stat.exists == false
+
+
+# Setup gVisor repo
+- name: Check if gvisor gpg key file exists
+  stat:
+    path: /etc/apt/keyrings/gvisor-archive-keyring.gpg
+  register: gpg_gvisor_key_file
+
+- name: Setup gvisor repo
+  shell: |
+    set -e
+    
+    # make sure to remove older gpg key file and apt list file
+    rm -f /etc/apt/keyrings/gvisor-archive-keyring.gpg
+    rm -f /etc/apt/sources.list.d/gvisor.list
+
+    # install new gpg key file and apt list file
+    curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor -o /etc/apt/keyrings/gvisor-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+  become: true
+  when: gpg_gvisor_key_file.stat.exists == false
+
+- name: Update apt
+  apt:
+    update_cache: yes
+  become: true
+  when: gpg_gvisor_key_file.stat.exists == false or gpg_key_file.stat.exists == false
+
+- name: Install kubernetes packages
+  apt:
+    name: "{{ item }}={{ kube_version }}.0-1.1"
+    state: present
+  become: true
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+    - cri-tools
+  
+- name: Hold kubernetes packages
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  become: true
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+    - cri-tools
+
+- name: Install gVisor
+  apt:
+    name: runsc
+    state: present
+  become: true
+

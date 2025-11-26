@@ -1,0 +1,74 @@
+# Check if kubelet is already running (indicates node is joined)
+- name: Check if kubelet is running
+  systemd_service:
+    name: kubelet
+  register: kubelet_status
+  ignore_errors: false
+  changed_when: false
+
+- name: Tries to reset node if a previous installation failed
+  block:
+    - name: Stop kubelet service if running
+      systemd_service:
+        name: kubelet
+        state: stopped
+        enabled: no
+      become: true
+      ignore_errors: true
+
+    - name: Reset kubeadm state
+      shell: |
+        kubeadm reset -f
+      become: true
+      ignore_errors: true
+
+    - name: Remove kubelet.conf because kubeadm will fail if it exists
+      shell: |
+        rm -rf /etc/kubernetes/kubelet.conf
+      become: true
+      ignore_errors: true
+
+    - name: Remove kubeadm kubelet flags to avoid stale runtime endpoint
+      shell: |
+        rm -f /var/lib/kubelet/kubeadm-flags.env
+      become: true
+      ignore_errors: true
+  when: kubelet_status.status.ActiveState == 'failed' or kubelet_status.status.ActiveState == 'activating'
+ 
+# create a new join command running against external api server address
+- name: Make the worker join the cluster
+  block:
+  - name: Create join command
+    shell: kubeadm token create --print-join-command
+    register: join_command
+    become: true
+    delegate_to: controlplane
+    vars:
+      ansible_user: vagrant
+
+  # join node
+  - name: Join node
+    shell: "{{ join_command.stdout }}"
+    become: true
+
+  # extract token from join command and delete it
+  - name: Extract token from join command
+    shell: echo "{{ join_command.stdout }}" | grep -oP '(?<=--token\s)\S+' | head -1
+    register: token_to_delete
+    become: true
+
+  - name: Delete created token
+    shell: kubeadm token delete "{{ token_to_delete.stdout }}"
+    become: true
+    delegate_to: controlplane
+    vars:
+      ansible_user: vagrant
+  when: kubelet_status.status.ActiveState != 'active'
+
+- name: Ensure kubelet is running and enabled
+  systemd_service:
+    name: kubelet
+    enabled: yes
+    state: started
+  timeout: 60
+

@@ -77,3 +77,26 @@
     cilium status --wait --wait-duration 10m
   become: true
   changed_when: false
+
+- name: Install MetalLB
+  shell: |
+    kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.16.1/config/manifests/metallb-frr-k8s.yaml
+  become: true
+
+- name: Wait for MetalLB controller to be ready
+  shell: |
+    kubectl -n metallb-system rollout status deployment/controller --timeout=300s
+  become: true
+  changed_when: false
+
+# The validating webhook may not answer right after the controller becomes ready
+- name: Configure MetalLB address pool
+  shell: |
+    kubectl apply -f -
+  args:
+    stdin: "{{ lookup('file', playbook_dir + '/../metallb.yml') }}"
+  become: true
+  register: metallb_config
+  until: metallb_config is succeeded
+  retries: 10
+  delay: 15

@@ -1,14 +1,50 @@
+ssh_dir = File.join(__dir__, "ssh")
+ssh_key = File.join(ssh_dir, "id_ed25519_playground")
+ssh_pub = ssh_key + ".pub"
+
+unless File.exist?(ssh_key) && File.exist?(ssh_pub)
+  Dir.mkdir(ssh_dir) unless Dir.exist?(ssh_dir)
+  unless File.exist?(ssh_key)
+    system("ssh-keygen -t ed25519 -N '' -f #{ssh_key}")
+  end
+  unless File.exist?(ssh_pub)
+    system("ssh-keygen -y -f #{ssh_key} > #{ssh_pub}")
+  end
+end
+
 IP_BASE = "192.168.99"
 N = 2
+
+ssh_config = File.join(ssh_dir, "config")
+File.open(ssh_config, "w", 0600) do |f|
+  f.puts "Host k8s-api-server"
+  f.puts "  HostName #{IP_BASE}.200"
+  f.puts "  User root"
+  f.puts "  IdentityFile ~/.ssh/id_ed25519_playground"
+  f.puts "  StrictHostKeyChecking no"
+  f.puts "  UserKnownHostsFile /dev/null"
+  f.puts
+
+  (1..N).each do |i|
+    f.puts "Host node0#{i}"
+    f.puts "  HostName #{IP_BASE}.#{i+200}"
+    f.puts "  User root"
+    f.puts "  IdentityFile ~/.ssh/id_ed25519_playground"
+    f.puts "  StrictHostKeyChecking no"
+    f.puts "  UserKnownHostsFile /dev/null"
+    f.puts
+  end
+end
+
 Vagrant.configure('2') do |config|
   config.vm.provider "virtualbox" do |v|
       v.memory = 2048
       v.cpus = 1
   end
-  config.vm.define "controlplane" do |machine|
+  config.vm.define "k8s-api-server" do |machine|
     machine.vm.box = 'bento/ubuntu-24.04'
     machine.vm.network "private_network", ip: "#{IP_BASE}.200"
-    machine.vm.hostname = "controlplane"
+    machine.vm.hostname = "k8s-api-server"
     machine.vm.provision "ansible" do |ansible|
         ansible.playbook = "ansible-k8s/controlplane-playbook.yml"
         ansible.extra_vars = {
@@ -20,10 +56,10 @@ Vagrant.configure('2') do |config|
   end
 
   (1..N).each do |i|
-      config.vm.define "k8s-worker-000#{i}" do |node|
+      config.vm.define "node0#{i}" do |node|
           node.vm.box = 'bento/ubuntu-24.04'
           node.vm.network "private_network", ip: "#{IP_BASE}.#{i+200}"
-          node.vm.hostname = "k8s-worker-000#{i}"
+          node.vm.hostname = "node0#{i}"
           node.vm.provision "ansible" do |ansible|
               ansible.playbook = "ansible-k8s/worker-playbook.yml"
               ansible.extra_vars = {

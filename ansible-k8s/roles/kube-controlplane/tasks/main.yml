@@ -23,7 +23,7 @@
   become: true
   run_once: true
 
-- name: Update exported admin.conf server to use controlplane IP
+- name: Update exported admin.conf server to use k8s-api-server IP
   lineinfile:
     path: "{{ playbook_dir }}/../vagrant-kubeconfig"
     regexp: '^\s*server:\s*https://.*'
@@ -31,12 +31,13 @@
   delegate_to: localhost
   run_once: true
 
-- name: Check if cilium already exists
+- name: Check if Cilium CLI exists
   shell: |
-    cilium version
+    command -v cilium
   become: true
-  register: cilium_exists
-  ignore_errors: true
+  register: cilium_cli_exists
+  changed_when: false
+  failed_when: false
 
 - name: Download Cilium CLI
   shell: |
@@ -50,10 +51,29 @@
     tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
     rm -f cilium-linux-${CLI_ARCH}.tar.gz*
   become: true
-  when: cilium_exists.rc != 0
+  when: cilium_cli_exists.rc != 0
 
+- name: Check if Cilium is installed in the cluster
+  shell: |
+    kubectl -n kube-system get daemonset cilium
+  become: true
+  register: cilium_installed
+  changed_when: false
+  failed_when: false
+
+# Every Vagrant VM has the same NAT address on eth0 (10.0.2.15), so Cilium must be
+# pinned to the host-only interface (eth1), otherwise the VXLAN tunnels between
+# nodes point at the same IP and cross-node pod traffic (e.g. admission webhooks) breaks.
 - name: Install Cilium CNI
   shell: |
-    cilium install --version 1.18.4
+    cilium install --version 1.18.4 \
+      --set devices=eth1 \
+      --set ipam.operator.clusterPoolIPv4PodCIDRList=192.90.0.0/16
   become: true
-  when: cilium_exists.rc != 0
+  when: cilium_installed.rc != 0
+
+- name: Wait for Cilium to be ready
+  shell: |
+    cilium status --wait --wait-duration 10m
+  become: true
+  changed_when: false

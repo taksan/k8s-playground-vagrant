@@ -42,7 +42,7 @@
     shell: kubeadm token create --print-join-command
     register: join_command
     become: true
-    delegate_to: controlplane
+    delegate_to: k8s-api-server
     vars:
       ansible_user: vagrant
 
@@ -60,7 +60,7 @@
   - name: Delete created token
     shell: kubeadm token delete "{{ token_to_delete.stdout }}"
     become: true
-    delegate_to: controlplane
+    delegate_to: k8s-api-server
     vars:
       ansible_user: vagrant
   when: kubelet_status.status.ActiveState != 'active'
@@ -70,5 +70,4 @@
     name: kubelet
     enabled: yes
     state: started
-  timeout: 60
-
+  become: true

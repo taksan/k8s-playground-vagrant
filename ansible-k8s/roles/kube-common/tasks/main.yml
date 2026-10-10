@@ -1,4 +1,20 @@
 # swap is disabled because kubelet doesn't support it
+- name: Ensure root .ssh directory exists
+  become: true
+  file:
+    path: /root/.ssh
+    state: directory
+    owner: root
+    group: root
+    mode: '0700'
+
+- name: Authorize playground SSH key for root user
+  become: true
+  authorized_key:
+    user: root
+    state: present
+    key: "{{ lookup('file', playbook_dir + '/../ssh/id_ed25519_playground.pub') }}"
+
 - name: Disables swap removing from /etc/fstab
   mount:
     name: "{{ item }}"
@@ -49,7 +65,7 @@
     state: present
   become: true
 
-- name: Create containderd config
+- name: Create containerd config
   shell: |
     mkdir -p /etc/containerd
     containerd config default > /etc/containerd/config.toml
@@ -82,6 +98,7 @@
     - ca-certificates 
     - curl
     - gpg
+    - git
 
 # Setup k8 srepo
 - name: Check if k8s gpg key file exists
@@ -150,6 +167,16 @@
     - kubeadm
     - kubectl
     - cri-tools
+
+- name: Set kubelet node IP
+  copy:
+    dest: /etc/default/kubelet
+    content: "KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}\n"
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+  notify: restart kubelet
 
 - name: Install gVisor
   apt:

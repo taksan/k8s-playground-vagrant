@@ -64,11 +64,14 @@
 # Every Vagrant VM has the same NAT address on eth0 (10.0.2.15), so Cilium must be
 # pinned to the host-only interface (eth1), otherwise the VXLAN tunnels between
 # nodes point at the same IP and cross-node pod traffic (e.g. admission webhooks) breaks.
+# Pod-to-pod traffic between nodes is encrypted with WireGuard (IPsec is mutually exclusive).
 - name: Install Cilium CNI
   shell: |
     cilium install --version 1.18.4 \
       --set devices=eth1 \
-      --set ipam.operator.clusterPoolIPv4PodCIDRList=192.90.0.0/16
+      --set ipam.operator.clusterPoolIPv4PodCIDRList=192.90.0.0/16 \
+      --set encryption.enabled=true \
+      --set encryption.type=wireguard
   become: true
   when: cilium_installed.rc != 0
 

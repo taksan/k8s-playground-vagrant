@@ -237,3 +237,22 @@
     state: started
     daemon_reload: true
   become: true
+
+- name: Check if yq exists
+  shell: command -v yq
+  become: true
+  register: yq_exists
+  changed_when: false
+  failed_when: false
+
+- name: Install yq
+  shell: |
+    set -e
+    YQ_VERSION=v4.47.1
+    ARCH=$(dpkg --print-architecture)
+    curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${ARCH}
+    chmod 0755 /usr/local/bin/yq
+  args:
+    executable: /bin/bash
+  become: true
+  when: yq_exists.rc != 0

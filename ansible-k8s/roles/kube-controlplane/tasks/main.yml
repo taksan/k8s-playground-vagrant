@@ -216,6 +216,21 @@
       --set pilot.resources.requests.memory=256Mi
   become: true
 
+# Traefik ingress controller, exposed through a MetalLB LoadBalancer IP. Installed without --wait since workers may not have joined yet; requests are kept small for the 2GB VMs.
+- name: Install Traefik ingress controller
+  shell: |
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    helm repo add traefik https://traefik.github.io/charts
+    helm repo update traefik
+    helm upgrade --install traefik traefik/traefik \
+      --version 37.1.0 --namespace traefik --create-namespace \
+      --set service.type=LoadBalancer \
+      --set ingressClass.enabled=true \
+      --set ingressClass.isDefaultClass=true \
+      --set resources.requests.cpu=100m \
+      --set resources.requests.memory=64Mi
+  become: true
+
 - name: Check if Trivy exists
   shell: command -v trivy
   become: true

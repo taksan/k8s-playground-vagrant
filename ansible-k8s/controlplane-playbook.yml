@@ -4,5 +4,6 @@
     - kube-common
 
 - hosts: all
+  gather_facts: false
   roles:
     - kube-controlplane

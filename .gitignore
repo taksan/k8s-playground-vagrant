@@ -2,3 +2,4 @@ vagrant-kubeconfig
 .vagrant
 ssh/
 .idea/
+vagrant-kubeconfig-certs/

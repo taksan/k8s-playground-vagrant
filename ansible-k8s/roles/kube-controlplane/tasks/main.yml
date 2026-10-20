@@ -31,6 +31,53 @@
   delegate_to: localhost
   run_once: true
 
+- name: Read exported kubeconfig
+  slurp:
+    src: "{{ playbook_dir }}/../vagrant-kubeconfig"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  register: exported_kubeconfig
+
+- name: Create directory for kubeconfig credentials
+  file:
+    path: "{{ playbook_dir }}/../vagrant-kubeconfig-certs"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+# Skipped once the config already references files (no *-data fields left).
+- name: Extract CA, client certificate and client key into separate files
+  copy:
+    content: "{{ item.data | b64decode }}"
+    dest: "{{ playbook_dir }}/../vagrant-kubeconfig-certs/{{ item.file }}"
+    mode: "{{ item.mode }}"
+  delegate_to: localhost
+  become: false
+  run_once: true
+  no_log: true
+  when: item.data | length > 0
+  loop:
+    - { file: ca.crt, mode: "0644", data: "{{ (exported_kubeconfig.content | b64decode | from_yaml).clusters[0].cluster['certificate-authority-data'] | default('') }}" }
+    - { file: client.crt, mode: "0644", data: "{{ (exported_kubeconfig.content | b64decode | from_yaml).users[0].user['client-certificate-data'] | default('') }}" }
+    - { file: client.key, mode: "0600", data: "{{ (exported_kubeconfig.content | b64decode | from_yaml).users[0].user['client-key-data'] | default('') }}" }
+
+- name: Reference credential files from the exported kubeconfig
+  lineinfile:
+    path: "{{ playbook_dir }}/../vagrant-kubeconfig"
+    regexp: '^(\s*){{ item.key }}-data:'
+    line: '\1{{ item.key }}: vagrant-kubeconfig-certs/{{ item.file }}'
+    backrefs: true
+  delegate_to: localhost
+  become: false
+  run_once: true
+  loop:
+    - { key: certificate-authority, file: ca.crt }
+    - { key: client-certificate, file: client.crt }
+    - { key: client-key, file: client.key }
+
 - name: Check if Cilium CLI exists
   shell: |
     command -v cilium
@@ -86,6 +133,14 @@
     kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.16.1/config/manifests/metallb-frr-k8s.yaml
   become: true
 
+# The control plane is provisioned before the workers exist, and the controller has no
+# toleration for the control-plane taint, so it would stay Pending and block the rollout wait.
+- name: Allow MetalLB controller to run on the control plane
+  shell: |
+    kubectl -n metallb-system patch deployment controller --type=json \
+      -p='[{"op":"add","path":"/spec/template/spec/tolerations","value":[{"key":"node-role.kubernetes.io/control-plane","operator":"Exists","effect":"NoSchedule"}]}]'
+  become: true
+
 - name: Wait for MetalLB controller to be ready
   shell: |
     kubectl -n metallb-system rollout status deployment/controller --timeout=300s
@@ -103,3 +158,87 @@
   until: metallb_config is succeeded
   retries: 10
   delay: 15
+
+- name: Create gVisor RuntimeClass
+  shell: |
+    kubectl apply -f -
+  args:
+    stdin: |
+      apiVersion: node.k8s.io/v1
+      kind: RuntimeClass
+      metadata:
+        name: gvisor
+      handler: runsc
+  become: true
+
+- name: Check if Helm exists
+  shell: command -v helm
+  become: true
+  register: helm_exists
+  changed_when: false
+  failed_when: false
+
+- name: Install Helm
+  shell: |
+    set -e
+    HELM_VERSION=v3.18.6
+    ARCH=$(dpkg --print-architecture)
+    cd "$(mktemp -d)"
+    curl -fsSLO https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz
+    curl -fsSL https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz.sha256sum | sha256sum --check
+    tar xzf helm-${HELM_VERSION}-linux-${ARCH}.tar.gz
+    install -m 0755 linux-${ARCH}/helm /usr/local/bin/helm
+  args:
+    executable: /bin/bash
+  become: true
+  when: helm_exists.rc != 0
+
+# Falco now runs as a systemd service on each VM (kube-common role); remove the old Helm release.
+- name: Remove Falco Helm release
+  shell: |
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    if helm status falco -n falco >/dev/null 2>&1; then
+      helm uninstall falco -n falco
+    fi
+    kubectl delete namespace falco --ignore-not-found
+  become: true
+
+# Istio (sidecar mode): CRDs + istiod. Installed without --wait since workers may not have joined yet; requests are kept small for the 2GB VMs.
+- name: Install Istio
+  shell: |
+    export KUBECONFIG=/etc/kubernetes/admin.conf
+    helm repo add istio https://istio-release.storage.googleapis.com/charts
+    helm upgrade --install istio-base istio/base \
+      --version 1.29.9 --namespace istio-system --create-namespace
+    helm upgrade --install istiod istio/istiod \
+      --version 1.29.9 --namespace istio-system \
+      --set pilot.resources.requests.cpu=100m \
+      --set pilot.resources.requests.memory=256Mi
+  become: true
+
+- name: Check if Trivy exists
+  shell: command -v trivy
+  become: true
+  register: trivy_exists
+  changed_when: false
+  failed_when: false
+
+- name: Install Trivy
+  shell: |
+    set -e
+    TRIVY_VERSION=0.76.0
+    case "$(dpkg --print-architecture)" in
+      amd64) TRIVY_ARCH=64bit ;;
+      arm64) TRIVY_ARCH=ARM64 ;;
+    esac
+    cd "$(mktemp -d)"
+    BASE=https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}
+    curl -fsSLO ${BASE}/trivy_${TRIVY_VERSION}_Linux-${TRIVY_ARCH}.tar.gz
+    curl -fsSLO ${BASE}/trivy_${TRIVY_VERSION}_checksums.txt
+    grep " trivy_${TRIVY_VERSION}_Linux-${TRIVY_ARCH}.tar.gz\$" trivy_${TRIVY_VERSION}_checksums.txt | sha256sum --check
+    tar xzf trivy_${TRIVY_VERSION}_Linux-${TRIVY_ARCH}.tar.gz trivy
+    install -m 0755 trivy /usr/local/bin/trivy
+  args:
+    executable: /bin/bash
+  become: true
+  when: trivy_exists.rc != 0

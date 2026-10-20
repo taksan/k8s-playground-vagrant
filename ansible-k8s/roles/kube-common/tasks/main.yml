@@ -33,6 +33,7 @@
 - name: Update apt
   apt:
     update_cache: yes
+    cache_valid_time: 3600
   become: true
 
 - name: Create contained.conf
@@ -41,34 +42,18 @@
     dest: /etc/modules-load.d/containerd.conf
   become: true
 
-- name: Run modprobe overlay
-  shell: modprobe overlay
+- name: Load kernel modules
+  command: modprobe {{ item }}
   become: true
-
-- name: Run modprobe br_netfilter
-  shell: modprobe br_netfilter
-  become: true
+  changed_when: false
+  loop:
+    - overlay
+    - br_netfilter
 
 - name: Create kubernetes-cri.conf
   template:
     src: templates/kubernetes-cri.conf.j2
     dest: /etc/sysctl.d/99-kubernetes-cri.conf
-  become: true
-
-- name: Apply sysctl settings
-  shell: sysctl --system
-  become: true
-
-- name: Install containerd
-  package:
-    name: containerd
-    state: present
-  become: true
-
-- name: Create containerd config
-  shell: |
-    mkdir -p /etc/containerd
-    containerd config default > /etc/containerd/config.toml
   become: true
 
 - name: Create kernel config
@@ -81,26 +66,18 @@
   shell: sysctl --system
   become: true
 
-# change containderd config
-- name: Change containerd config
-  shell: |
-    sed -i 's/SystemdCgroup = false/SystemdCgroup = true/g' /etc/containerd/config.toml
-  become: true
-  notify: restart containerd
-
-- name: Install packages to setup kubernetes repo
-  package:
-    name: "{{ item }}"
+- name: Install packages to setup the apt repos
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gpg
+      - git
     state: present
   become: true
-  loop:
-    - apt-transport-https 
-    - ca-certificates 
-    - curl
-    - gpg
-    - git
 
-# Setup k8 srepo
+# Setup k8s repo
 - name: Check if k8s gpg key file exists
   stat:
     path: /etc/apt/keyrings/kubernetes-{{kube_version}}-apt-keyring.gpg
@@ -119,7 +96,6 @@
   become: true
   when: gpg_key_file.stat.exists == false
 
-
 # Setup gVisor repo
 - name: Check if gvisor gpg key file exists
   stat:
@@ -129,34 +105,50 @@
 - name: Setup gvisor repo
   shell: |
     set -e
-    
+
     # make sure to remove older gpg key file and apt list file
     rm -f /etc/apt/keyrings/gvisor-archive-keyring.gpg
     rm -f /etc/apt/sources.list.d/gvisor.list
 
     # install new gpg key file and apt list file
     curl -fsSL https://gvisor.dev/archive.key | gpg --dearmor -o /etc/apt/keyrings/gvisor-archive-keyring.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" | sudo tee /etc/apt/sources.list.d/gvisor.list > /dev/null
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" > /etc/apt/sources.list.d/gvisor.list
   become: true
   when: gpg_gvisor_key_file.stat.exists == false
 
-- name: Update apt
-  apt:
-    update_cache: yes
-  become: true
-  when: gpg_gvisor_key_file.stat.exists == false or gpg_key_file.stat.exists == false
+# Setup Falco repo
+- name: Check if falco apt key exists
+  stat:
+    path: /etc/apt/keyrings/falco-archive-keyring.gpg
+  register: falco_key_file
 
-- name: Install kubernetes packages
-  apt:
-    name: "{{ item }}={{ kube_version }}.0-1.1"
-    state: present
+- name: Setup falco repo
+  shell: |
+    set -e
+    curl -fsSL https://falco.org/repo/falcosecurity-packages.asc | gpg --dearmor -o /etc/apt/keyrings/falco-archive-keyring.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/falco-archive-keyring.gpg] https://download.falco.org/packages/deb stable main" > /etc/apt/sources.list.d/falcosecurity.list
   become: true
-  loop:
-    - kubelet
-    - kubeadm
-    - kubectl
-    - cri-tools
-  
+  when: falco_key_file.stat.exists == false
+
+# Single apt update + single apt transaction for everything (containerd, kubernetes, gVisor, Falco).
+# Falco's package setup reads these variables so it does not prompt for a driver.
+- name: Install containerd, kubernetes, gVisor and Falco packages
+  apt:
+    name:
+      - containerd
+      - "kubelet={{ kube_version }}.0-1.1"
+      - "kubeadm={{ kube_version }}.0-1.1"
+      - "kubectl={{ kube_version }}.0-1.1"
+      - "cri-tools={{ kube_version }}.0-1.1"
+      - runsc
+      - falco
+    state: present
+    update_cache: "{{ gpg_key_file.stat.exists == false or gpg_gvisor_key_file.stat.exists == false or falco_key_file.stat.exists == false }}"
+  environment:
+    FALCO_FRONTEND: noninteractive
+    FALCO_DRIVER_CHOICE: modern_ebpf
+  become: true
+
 - name: Hold kubernetes packages
   dpkg_selections:
     name: "{{ item }}"
@@ -168,6 +160,53 @@
     - kubectl
     - cri-tools
 
+# Generate the default containerd config only once so re-provisioning does not
+# rewrite it and restart containerd every time.
+- name: Create containerd config
+  shell: |
+    mkdir -p /etc/containerd
+    if ! grep -q SystemdCgroup /etc/containerd/config.toml 2>/dev/null; then
+      containerd config default > /etc/containerd/config.toml
+      echo generated
+    fi
+  register: containerd_config
+  changed_when: "'generated' in containerd_config.stdout"
+  become: true
+  notify: restart containerd
+
+- name: Use systemd cgroup driver in containerd
+  replace:
+    path: /etc/containerd/config.toml
+    regexp: 'SystemdCgroup = false'
+    replace: 'SystemdCgroup = true'
+  become: true
+  notify: restart containerd
+
+# Register gVisor (runsc) as a containerd runtime. The CRI plugin id differs between
+# containerd 1.x (io.containerd.grpc.v1.cri) and 2.x (io.containerd.cri.v1.runtime).
+- name: Register runsc runtime in containerd config
+  shell: |
+    set -e
+    CFG=/etc/containerd/config.toml
+    if grep -q "runtimes.runsc" "$CFG"; then exit 0; fi
+    if grep -q "io.containerd.cri.v1.runtime" "$CFG"; then
+      PLUGIN="io.containerd.cri.v1.runtime"
+    else
+      PLUGIN="io.containerd.grpc.v1.cri"
+    fi
+    cat >> "$CFG" <<EOT
+
+    [plugins.'${PLUGIN}'.containerd.runtimes.runsc]
+      runtime_type = 'io.containerd.runsc.v1'
+    EOT
+    echo added
+  args:
+    executable: /bin/bash
+  register: runsc_runtime
+  changed_when: "'added' in runsc_runtime.stdout"
+  become: true
+  notify: restart containerd
+
 - name: Set kubelet node IP
   copy:
     dest: /etc/default/kubelet
@@ -178,9 +217,23 @@
   become: true
   notify: restart kubelet
 
-- name: Install gVisor
-  apt:
-    name: runsc
-    state: present
+# Falco as a regular systemd service on every VM (modern eBPF driver, no kernel module)
+- name: Disable unused falco driver services
+  systemd_service:
+    name: "{{ item }}"
+    enabled: false
+    state: stopped
   become: true
+  ignore_errors: true
+  loop:
+    - falco-bpf
+    - falco-kmod
+    - falco
 
+- name: Enable and start falco (modern eBPF)
+  systemd_service:
+    name: falco-modern-bpf
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true

@@ -30,6 +30,37 @@
   when: ansible_swaptotal_mb > 0
   become: true
 
+# unattended upgrades can hold the apt lock and restart services behind the cluster's back
+- name: Stop and disable apt upgrade timers
+  systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+    masked: true
+  loop:
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+    - unattended-upgrades.service
+  failed_when: false
+  become: true
+
+- name: Disable periodic apt updates and unattended upgrades
+  copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Unattended-Upgrade "0";
+    owner: root
+    group: root
+    mode: '0644'
+  become: true
+
+- name: Remove unattended-upgrades package
+  apt:
+    name: unattended-upgrades
+    state: absent
+  become: true
+
 - name: Update apt
   apt:
     update_cache: yes
@@ -74,6 +105,12 @@
       - curl
       - gpg
       - git
+    state: present
+  become: true
+
+- name: Install net-tools
+  apt:
+    name: net-tools
     state: present
   become: true
 
@@ -256,3 +293,54 @@
     executable: /bin/bash
   become: true
   when: yq_exists.rc != 0
+
+- name: Check if kube-bench exists
+  shell: command -v kube-bench
+  become: true
+  register: kube_bench_exists
+  changed_when: false
+  failed_when: false
+
+# The tarball ships the CIS benchmark definitions in cfg/, which kube-bench is pointed at with --config-dir.
+- name: Install kube-bench
+  shell: |
+    set -e
+    KUBE_BENCH_VERSION=0.11.1
+    ARCH=$(dpkg --print-architecture)
+    cd "$(mktemp -d)"
+    BASE=https://github.com/aquasecurity/kube-bench/releases/download/v${KUBE_BENCH_VERSION}
+    curl -fsSLO ${BASE}/kube-bench_${KUBE_BENCH_VERSION}_linux_${ARCH}.tar.gz
+    curl -fsSLO ${BASE}/kube-bench_${KUBE_BENCH_VERSION}_checksums.txt
+    grep " kube-bench_${KUBE_BENCH_VERSION}_linux_${ARCH}.tar.gz\$" kube-bench_${KUBE_BENCH_VERSION}_checksums.txt | sha256sum --check
+    tar xzf kube-bench_${KUBE_BENCH_VERSION}_linux_${ARCH}.tar.gz
+    install -m 0755 kube-bench /usr/local/bin/kube-bench
+    rm -rf /etc/kube-bench
+    mkdir -p /etc/kube-bench
+    cp -r cfg /etc/kube-bench/cfg
+  args:
+    executable: /bin/bash
+  become: true
+  when: kube_bench_exists.rc != 0
+
+- name: Check if cosign exists
+  shell: command -v cosign
+  become: true
+  register: cosign_exists
+  changed_when: false
+  failed_when: false
+
+- name: Install cosign
+  shell: |
+    set -e
+    COSIGN_VERSION=v3.0.2
+    ARCH=$(dpkg --print-architecture)
+    cd "$(mktemp -d)"
+    BASE=https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}
+    curl -fsSLO ${BASE}/cosign-linux-${ARCH}
+    curl -fsSLO ${BASE}/cosign_checksums.txt
+    grep " cosign-linux-${ARCH}\$" cosign_checksums.txt | sha256sum --check
+    install -m 0755 cosign-linux-${ARCH} /usr/local/bin/cosign
+  args:
+    executable: /bin/bash
+  become: true
+  when: cosign_exists.rc != 0

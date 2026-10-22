@@ -118,9 +118,36 @@
       --set devices=eth1 \
       --set ipam.operator.clusterPoolIPv4PodCIDRList=192.90.0.0/16 \
       --set encryption.enabled=true \
-      --set encryption.type=wireguard
+      --set encryption.type=wireguard \
+      --set authentication.mutual.spire.enabled=true \
+      --set authentication.mutual.spire.install.enabled=true \
+      --set authentication.mutual.spire.install.server.dataStorage.enabled=false \
+      --set authentication.mutual.spire.install.server.securityContext.runAsUser=0 \
+      --set authentication.mutual.spire.install.server.securityContext.runAsNonRoot=false
   become: true
   when: cilium_installed.rc != 0
+
+# Mutual authentication via a SPIRE server (StatefulSet) and agents (DaemonSet) in cilium-spire.
+# The cluster has no StorageClass, so the server's data volume is disabled (emptyDir): its state is lost on restart.
+# The server runs as root because its socket lives in a root-owned hostPath directory.
+- name: Check if SPIRE server is installed
+  shell: |
+    kubectl -n cilium-spire get statefulset spire-server
+  become: true
+  register: spire_installed
+  changed_when: false
+  failed_when: false
+
+- name: Enable SPIRE on an existing Cilium install
+  shell: |
+    cilium upgrade --version 1.18.4 --reuse-values \
+      --set authentication.mutual.spire.enabled=true \
+      --set authentication.mutual.spire.install.enabled=true \
+      --set authentication.mutual.spire.install.server.dataStorage.enabled=false \
+      --set authentication.mutual.spire.install.server.securityContext.runAsUser=0 \
+      --set authentication.mutual.spire.install.server.securityContext.runAsNonRoot=false
+  become: true
+  when: spire_installed.rc != 0 and cilium_installed.rc == 0
 
 - name: Wait for Cilium to be ready
   shell: |
